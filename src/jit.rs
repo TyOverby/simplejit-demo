@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use cretonne::prelude::*;
 use cretonne_module::{Module, Linkage, DataContext, Writability};
-use cretonne_simplejit::{SimpleJITBuilder, SimpleJITBackend};
-use std::slice;
+use cretonne_faerie::{FaerieBuilder, FaerieBackend, Format};
+use std::fs::File;
 
 /// The AST node for expressions.
 pub enum Expr {
@@ -47,18 +47,25 @@ pub struct JIT {
 
     /// The module, with the simplejit backend, which manages the JIT'd
     /// functions.
-    module: Module<SimpleJITBackend>,
+    module: Module<FaerieBackend>,
 }
 
 impl JIT {
     /// Create a new `JIT` instance.
-    pub fn new() -> Self {
+    pub fn new(name: &str) -> Self {
         // Windows calling conventions are not supported yet.
         if cfg!(windows) {
             unimplemented!();
         }
 
-        let builder = SimpleJITBuilder::new();
+        // Target x86-64 for now. Also, faerie requires PIC.
+        let mut flag_builder = settings::builder();
+        flag_builder.enable("is_64bit").unwrap();
+        flag_builder.enable("is_pic").unwrap();
+        let isa_builder = isa::lookup("x86").unwrap();
+        let isa = isa_builder.finish(settings::Flags::new(&flag_builder));
+
+        let builder = FaerieBuilder::new(isa, name.to_owned(), Format::ELF).unwrap();
         Self {
             builder_context: FunctionBuilderContext::<Variable>::new(),
             ctx: codegen::Context::new(),
@@ -68,7 +75,7 @@ impl JIT {
     }
 
     /// Compile a string in the toy language into machine code.
-    pub fn compile(&mut self, input: &str) -> Result<*const u8, String> {
+    pub fn compile(&mut self, input: &str) -> Result<(), String> {
         // First, parse the string, producing AST nodes.
         let (name, params, the_return, stmts) =
             parser::function(&input).map_err(|e| e.to_string())?;
@@ -104,13 +111,13 @@ impl JIT {
 
         // Finalize the function, finishing any outstanding relocations. The
         // result is a pointer to the finished machine code.
-        let code = self.module.finalize_function(id);
+        self.module.finalize_function(id);
 
-        Ok(code)
+        Ok(())
     }
 
     /// Create a zero-initialized data section.
-    pub fn create_data(&mut self, name: &str, contents: Vec<u8>) -> Result<&[u8], String> {
+    pub fn create_data(&mut self, name: &str, contents: Vec<u8>) -> Result<(), String> {
         // The steps here are analogous to `compile`, except that data is much
         // simpler than functions.
         self.data_ctx.define(
@@ -125,9 +132,8 @@ impl JIT {
             |e| e.to_string(),
         )?;
         self.data_ctx.clear();
-        let buffer = self.module.finalize_data(id);
-        // TODO: Can we move the unsafe into cretonne?
-        Ok(unsafe { slice::from_raw_parts(buffer.0, buffer.1) })
+        self.module.finalize_data(id);
+        Ok(())
     }
 
     // Translate from toy-language AST nodes into Cretonne IR.
@@ -199,6 +205,13 @@ impl JIT {
         trans.builder.finalize();
         Ok(())
     }
+
+    /// Consume self and write out an object file.
+    pub fn finish(self) {
+        let product = self.module.finish();
+        let file = File::create(product.name()).expect("error opening file");
+        product.write(file).expect("error writing to file");
+    }
 }
 
 /// A collection of state used for translating from toy-language AST nodes
@@ -207,7 +220,7 @@ struct FunctionTranslator<'a> {
     int: types::Type,
     builder: FunctionBuilder<'a, Variable>,
     variables: HashMap<String, Variable>,
-    module: &'a mut Module<SimpleJITBackend>,
+    module: &'a mut Module<FaerieBackend>,
 }
 
 impl<'a> FunctionTranslator<'a> {
